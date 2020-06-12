@@ -12,7 +12,7 @@ using Xunit.Abstractions;
 #if NETCOREAPP1_0
 using System.Reflection;
 using System.Text;
-using Microsoft.DotNet.PlatformAbstractions;
+using Microsoft.DotNet.InternalAbstractions;
 using Microsoft.Extensions.DependencyModel;
 #elif NET452
 using System.Reflection;
@@ -211,7 +211,9 @@ namespace Xunit.Runner.VisualStudio
             {
                 RemotingUtility.CleanUpRegisteredChannels();
 
+#if NET452
                 using (AssemblyHelper.SubscribeResolve())
+#endif
                 {
                     foreach (var assemblyFileNameCanBeWithoutAbsolutePath in sources)
                     {
@@ -410,7 +412,10 @@ namespace Xunit.Runner.VisualStudio
                 var reporterMessageHandler = MessageSinkWithTypesAdapter.Wrap(GetRunnerReporter(runInfos.Select(ari => ari.AssemblyFileName))
                                                                         .CreateMessageHandler(new VisualStudioRunnerLogger(logger)));
 
+#if NET452
                 using (AssemblyHelper.SubscribeResolve())
+#endif
+                {
                     if (parallelizeAssemblies)
                         runInfos
                             .Select(runInfo => RunTestsInAssemblyAsync(runContext, frameworkHandle, logger, testPlatformContext, reporterMessageHandler, runInfo))
@@ -419,6 +424,7 @@ namespace Xunit.Runner.VisualStudio
                     else
                         runInfos
                             .ForEach(runInfo => RunTestsInAssembly(runContext, frameworkHandle, logger, testPlatformContext, reporterMessageHandler, runInfo));
+                }
             }
             catch (Exception ex)
             {
