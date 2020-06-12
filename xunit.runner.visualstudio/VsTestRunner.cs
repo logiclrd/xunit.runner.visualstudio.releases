@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -10,7 +11,7 @@ using Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Logging;
 using Xunit.Abstractions;
 
-#if NETCOREAPP1_0
+#if NETCOREAPP
 using System.Text;
 using Internal.Microsoft.DotNet.PlatformAbstractions;
 using Internal.Microsoft.Extensions.DependencyModel;
@@ -23,13 +24,16 @@ namespace Xunit.Runner.VisualStudio
     [FileExtension(".exe")]
     [DefaultExecutorUri(Constants.ExecutorUri)]
     [ExtensionUri(Constants.ExecutorUri)]
+#if !WINDOWS_UAP
+    [Category("managed")]
+#endif
     public class VsTestRunner : ITestDiscoverer, ITestExecutor
     {
         static IRunnerReporter[] NoReporters = new IRunnerReporter[0];
         static int PrintedHeader = 0;
         public static TestProperty SerializedTestCaseProperty = GetTestProperty();
 
-#if WINDOWS_UAP || NETCOREAPP1_0
+#if WINDOWS_UAP || NETCOREAPP
         static readonly AppDomainSupport AppDomainDefaultBehavior = AppDomainSupport.Denied;
 #else
         static readonly AppDomainSupport AppDomainDefaultBehavior = AppDomainSupport.Required;
@@ -106,9 +110,9 @@ namespace Xunit.Runner.VisualStudio
         {
             if (Interlocked.Exchange(ref PrintedHeader, 1) == 0)
             {
-#if NET452
+#if NETFRAMEWORK
                 var platform = $"Desktop .NET {Environment.Version}";
-#elif NETCOREAPP1_0
+#elif NETCOREAPP
                 var platform = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription;
 #elif WINDOWS_UAP
                 var platform = "Universal Windows";
@@ -148,7 +152,7 @@ namespace Xunit.Runner.VisualStudio
             {
 #if WINDOWS_UAP
                 var sourcePath = Windows.ApplicationModel.Package.Current.InstalledLocation.Path;
-#elif NETCOREAPP1_0
+#elif NETCOREAPP
                 var sourcePath = Directory.GetCurrentDirectory();
 #else
                 var sourcePath = Environment.CurrentDirectory;
@@ -357,7 +361,7 @@ namespace Xunit.Runner.VisualStudio
             if (platformAssemblies.Contains(Path.GetFileName(assemblyFileName)))
                 return false;
 
-#if NETCOREAPP1_0
+#if NETCOREAPP
             return IsXunitPackageReferenced(assemblyFileName);
 #else
 #if WINDOWS_UAP
@@ -372,7 +376,7 @@ namespace Xunit.Runner.VisualStudio
 
         }
 
-#if NETCOREAPP1_0
+#if NETCOREAPP
         static bool IsXunitPackageReferenced(string assemblyFileName)
         {
             var depsFile = assemblyFileName.Replace(".dll", ".deps.json");
@@ -660,11 +664,11 @@ namespace Xunit.Runner.VisualStudio
                 if (!string.IsNullOrEmpty(runSettings.ReporterSwitch))
                 {
                     reporter = availableReporters.Value.FirstOrDefault(r => string.Equals(r.RunnerSwitch, runSettings.ReporterSwitch, StringComparison.OrdinalIgnoreCase));
-                    if (reporter is default)
+                    if (reporter is null)
                         logger.LogWarning("Could not find requested reporter '{0}'", runSettings.ReporterSwitch);
                 }
 
-                if (reporter is default && !runSettings.NoAutoReporters)
+                if (reporter is null && !runSettings.NoAutoReporters)
                     reporter = availableReporters.Value.FirstOrDefault(r => r.IsEnvironmentallyEnabled);
             }
             catch { }
@@ -677,7 +681,7 @@ namespace Xunit.Runner.VisualStudio
 #if WINDOWS_UAP
             // No reporters on UWP
             return NoReporters;
-#elif NETCOREAPP1_0
+#elif NETCOREAPP
             // Combine all input libs and merge their contexts to find the potential reporters
             var result = new List<IRunnerReporter>();
             var dcjr = new DependencyContextJsonReader();
@@ -731,7 +735,7 @@ namespace Xunit.Runner.VisualStudio
             }
 
             return result;
-#elif NET452
+#elif NETFRAMEWORK
             var result = new List<IRunnerReporter>();
             var runnerPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().GetLocalCodeBase());
             var runnerReporterInterfaceAssemblyFullName = typeof(IRunnerReporter).Assembly.GetName().FullName;
