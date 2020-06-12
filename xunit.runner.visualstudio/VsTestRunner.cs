@@ -2,146 +2,209 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Xml;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel;
+using Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Logging;
 using Xunit.Sdk;
 using VsTestResult = Microsoft.VisualStudio.TestPlatform.ObjectModel.TestResult;
 
-namespace Xunit.Runner.VisualStudio {
+namespace Xunit.Runner.VisualStudio
+{
     [FileExtension(".dll")]
     [FileExtension(".exe")]
     [DefaultExecutorUri(VsTestRunner.ExecutorUri)]
     [ExtensionUri(VsTestRunner.ExecutorUri)]
-    public class VsTestRunner : ITestDiscoverer, ITestExecutor {
+    public class VsTestRunner : ITestDiscoverer, ITestExecutor
+    {
         public const string ExecutorUri = "executor://xunit.codeplex.com/VsTestRunner";
 
         private static Uri uri = new Uri(ExecutorUri);
 
         private bool cancelled;
 
-        public void Cancel() {
+        public void Cancel()
+        {
             cancelled = true;
         }
 
-        public void DiscoverTests(IEnumerable<string> sources, IMessageLogger logger, ITestCaseDiscoverySink discoverySink) {
+        public void DiscoverTests(IEnumerable<string> sources, IDiscoveryContext discoveryContext, IMessageLogger logger, ITestCaseDiscoverySink discoverySink)
+        {
             Guard.ArgumentNotNull("sources", sources);
             Guard.ArgumentNotNull("logger", logger);
             Guard.ArgumentNotNull("discoverySink", discoverySink);
 
+            RemotingUtility.CleanUpRegisteredChannels();
+
             foreach (string source in sources)
-                try {
+                try
+                {
                     if (IsXunitTestAssembly(source))
                         using (ExecutorWrapper executor = new ExecutorWrapper(source, configFilename: null, shadowCopy: true))
                             foreach (TestCase testCase in GetTestCases(executor))
                                 discoverySink.SendTestCase(testCase);
                 }
-                catch (Exception e) {
+                catch (Exception e)
+                {
                     logger.SendMessage(TestMessageLevel.Error, String.Format("xUnit.net: Exception discovering tests from {0}: {1}", source, e));
                 }
         }
 
-        static string GetDisplayName(string displayName, string shortMethodName, string fullyQualifiedMethodName) {
+        static string GetDisplayName(string displayName, string shortMethodName, string fullyQualifiedMethodName)
+        {
             return displayName == fullyQualifiedMethodName ? shortMethodName : displayName;
         }
 
-        static TestCase GetTestCase(string source, XmlNode methodNode) {
+        static TestCase GetTestCase(DiaSessionWrapper diaSession, string source, XmlNode methodNode)
+        {
             string typeName = methodNode.Attributes["type"].Value;
             string methodName = methodNode.Attributes["method"].Value;
             string displayName = methodNode.Attributes["name"].Value;
-            string fullyQualifiedName = typeName + "." + methodName;
+            string fullyQualifiedName = String.Format("{0}.{1}", typeName, methodName);
 
-            TestCase testCase = new TestCase(fullyQualifiedName, uri) {
+            TestCase testCase = new TestCase(fullyQualifiedName, uri, source)
+            {
                 DisplayName = GetDisplayName(displayName, methodName, fullyQualifiedName),
-                Source = source,
             };
 
-            try {
-                using (DiaSession diaSession = new DiaSession(source)) {
-                    DiaNavigationData navigationData = diaSession.GetNavigationData(typeName, methodName);
-                    testCase.CodeFilePath = navigationData.FileName;
-                    testCase.LineNumber = navigationData.MinLineNumber;
-                }
+            DiaNavigationData navigationData = diaSession.GetNavigationData(typeName, methodName);
+            if (navigationData != null)
+            {
+                testCase.CodeFilePath = navigationData.FileName;
+                testCase.LineNumber = navigationData.MinLineNumber;
             }
-            catch { } // DiaSession throws if the PDB file is missing or corrupt
 
             return testCase;
         }
 
-        static IEnumerable<TestCase> GetTestCases(ExecutorWrapper executor) {
-            foreach (XmlNode methodNode in executor.EnumerateTests().SelectNodes("//method"))
-                yield return GetTestCase(executor.AssemblyFilename, methodNode);
+        static IEnumerable<TestCase> GetTestCases(ExecutorWrapper executor)
+        {
+            string source = executor.AssemblyFilename;
+
+            using (DiaSessionWrapper diaSession = new DiaSessionWrapper(source))
+                foreach (XmlNode methodNode in executor.EnumerateTests().SelectNodes("//method"))
+                    yield return GetTestCase(diaSession, source, methodNode);
         }
 
-        static bool IsXunitTestAssembly(string assemblyFileName) {
+        static bool IsXunitTestAssembly(string assemblyFileName)
+        {
             string xunitPath = Path.Combine(Path.GetDirectoryName(assemblyFileName), "xunit.dll");
             return File.Exists(xunitPath);
         }
 
-        public void RunTests(IEnumerable<string> sources, IRunContext runContext, ITestExecutionRecorder testExecutionRecorder) {
+        public void RunTests(IEnumerable<string> sources, IRunContext runContext, IFrameworkHandle frameworkHandle)
+        {
             Guard.ArgumentNotNull("sources", sources);
             Guard.ArgumentNotNull("runContext", runContext);
-            Guard.ArgumentNotNull("testExecutionRecorder", testExecutionRecorder);
+            Guard.ArgumentNotNull("frameworkHandle", frameworkHandle);
 
-            foreach (string source in sources)
-                if (VsTestRunner.IsXunitTestAssembly(source))
-                    RunTestsInAssembly(source, runContext, testExecutionRecorder);
-        }
+            var cleanupList = new List<ExecutorWrapper>();
 
-        public void RunTests(IEnumerable<TestCase> tests, IRunContext runContext, ITestExecutionRecorder testExecutionRecorder) {
-            Guard.ArgumentNotNull("tests", tests);
-            Guard.ArgumentNotNull("runContext", runContext);
-            Guard.ArgumentNotNull("testExecutionRecorder", testExecutionRecorder);
+            try
+            {
+                RemotingUtility.CleanUpRegisteredChannels();
 
-            foreach (var testCaseGroup in tests.GroupBy(tc => tc.Source))
-                if (VsTestRunner.IsXunitTestAssembly(testCaseGroup.Key))
-                    RunTestsInAssembly(testCaseGroup.Key, runContext, testExecutionRecorder, testCaseGroup);
-        }
+                cancelled = false;
 
-        void RunTestsInAssembly(string assemblyFileName, IRunContext ctxt, ITestExecutionRecorder recorder, IEnumerable<TestCase> testCases = null) {
-            cancelled = false;
+                foreach (string source in sources)
+                    if (VsTestRunner.IsXunitTestAssembly(source))
+                        RunTestsInAssembly(cleanupList, source, frameworkHandle);
+            }
+            finally
+            {
+                Thread.Sleep(1000);
 
-            using (var executor = new ExecutorWrapper(assemblyFileName, configFilename: null, shadowCopy: true)) {
-                if (testCases == null)
-                    testCases = VsTestRunner.GetTestCases(executor).ToArray();
-
-                var logger = new VsRunnerLogger(recorder, testCases, () => cancelled);
-                var runner = new TestRunner(executor, logger);
-
-                foreach (var testClass in testCases.Select(tc => new TypeAndMethod(tc.Name))
-                                                   .GroupBy(tam => tam.Type))
-                    runner.RunTests(testClass.Key, testClass.Select(tam => tam.Method).ToList());
+                foreach (var executorWrapper in cleanupList)
+                    executorWrapper.Dispose();
             }
         }
 
-        class VsRunnerLogger : IRunnerLogger {
+        public void RunTests(IEnumerable<TestCase> tests, IRunContext runContext, IFrameworkHandle frameworkHandle)
+        {
+            Guard.ArgumentNotNull("tests", tests);
+            Guard.ArgumentNotNull("runContext", runContext);
+            Guard.ArgumentNotNull("frameworkHandle", frameworkHandle);
+
+            var cleanupList = new List<ExecutorWrapper>();
+
+            try
+            {
+                RemotingUtility.CleanUpRegisteredChannels();
+
+                cancelled = false;
+
+                foreach (var testCaseGroup in tests.GroupBy(tc => tc.Source))
+                    if (VsTestRunner.IsXunitTestAssembly(testCaseGroup.Key))
+                        RunTestsInAssembly(cleanupList, testCaseGroup.Key, frameworkHandle, testCaseGroup);
+            }
+            finally
+            {
+                Thread.Sleep(1000);
+
+                foreach (var executorWrapper in cleanupList)
+                    executorWrapper.Dispose();
+            }
+        }
+
+        void RunTestsInAssembly(List<ExecutorWrapper> cleanupList, string assemblyFileName, ITestExecutionRecorder recorder, IEnumerable<TestCase> testCases = null)
+        {
+            if (cancelled)
+                return;
+
+            var executor = new ExecutorWrapper(assemblyFileName, configFilename: null, shadowCopy: true);
+            cleanupList.Add(executor);
+
+            if (testCases == null)
+                testCases = VsTestRunner.GetTestCases(executor).ToArray();
+
+            var logger = new VsRunnerLogger(recorder, testCases, () => cancelled);
+            var runner = new TestRunner(executor, logger);
+
+            foreach (var testClass in testCases.Select(tc => new TypeAndMethod(tc.FullyQualifiedName))
+                                               .GroupBy(tam => tam.Type))
+            {
+                runner.RunTests(testClass.Key, testClass.Select(tam => tam.Method).ToList());
+                if (cancelled)
+                    return;
+            }
+        }
+
+        class VsRunnerLogger : IRunnerLogger
+        {
             Func<bool> cancelledThunk;
             ITestExecutionRecorder recorder;
             Dictionary<string, TestCase> testCases;
 
-            public VsRunnerLogger(ITestExecutionRecorder recorder, IEnumerable<TestCase> testCases, Func<bool> cancelledThunk) {
+            public VsRunnerLogger(ITestExecutionRecorder recorder, IEnumerable<TestCase> testCases, Func<bool> cancelledThunk)
+            {
                 this.recorder = recorder;
-                this.testCases = testCases.ToDictionary(tc => tc.Name);
+                this.testCases = testCases.ToDictionary(tc => tc.FullyQualifiedName);
                 this.cancelledThunk = cancelledThunk;
             }
 
-            public void AssemblyFinished(string assemblyFilename, int total, int failed, int skipped, double time) {
+            public void AssemblyFinished(string assemblyFilename, int total, int failed, int skipped, double time)
+            {
             }
 
-            public void AssemblyStart(string assemblyFilename, string configFilename, string xUnitVersion) {
+            public void AssemblyStart(string assemblyFilename, string configFilename, string xUnitVersion)
+            {
             }
 
-            public bool ClassFailed(string className, string exceptionType, string message, string stackTrace) {
+            public bool ClassFailed(string className, string exceptionType, string message, string stackTrace)
+            {
                 recorder.SendMessage(TestMessageLevel.Error, String.Format("Fixture {0} failed: {1}: {2}\r\n{3}", className, exceptionType, message, stackTrace));
                 return !cancelledThunk();
             }
 
-            public void ExceptionThrown(string assemblyFilename, Exception exception) {
+            public void ExceptionThrown(string assemblyFilename, Exception exception)
+            {
                 recorder.SendMessage(TestMessageLevel.Error, String.Format("Catastrophic failure: {0}", exception));
             }
 
-            public void TestFailed(string name, string type, string method, double duration, string output, string exceptionType, string message, string stackTrace) {
-                VsTestResult result = MakeVsTestResult(type, method, duration, output, TestOutcome.Failed);
+            public void TestFailed(string name, string type, string method, double duration, string output, string exceptionType, string message, string stackTrace)
+            {
+                VsTestResult result = MakeVsTestResult(name, type, method, duration, output, TestOutcome.Failed);
                 result.ErrorMessage = message;
                 result.ErrorStackTrace = stackTrace;
 
@@ -149,40 +212,75 @@ namespace Xunit.Runner.VisualStudio {
                 recorder.RecordResult(result);
             }
 
-            public bool TestFinished(string name, string type, string method) {
+            public bool TestFinished(string name, string type, string method)
+            {
                 return !cancelledThunk();
             }
 
-            public void TestPassed(string name, string type, string method, double duration, string output) {
-                VsTestResult result = MakeVsTestResult(type, method, duration, output, TestOutcome.Passed);
+            public void TestPassed(string name, string type, string method, double duration, string output)
+            {
+                VsTestResult result = MakeVsTestResult(name, type, method, duration, output, TestOutcome.Passed);
                 recorder.RecordEnd(result.TestCase, result.Outcome);
                 recorder.RecordResult(result);
             }
 
-            public void TestSkipped(string name, string type, string method, string reason) {
-                VsTestResult result = MakeVsTestResult(type, method, 0.0, null, TestOutcome.Skipped);
+            public void TestSkipped(string name, string type, string method, string reason)
+            {
+                VsTestResult result = MakeVsTestResult(name, type, method, 0.0, null, TestOutcome.Skipped);
                 recorder.RecordEnd(result.TestCase, result.Outcome);
                 recorder.RecordResult(result);
             }
 
-            public bool TestStart(string name, string type, string method) {
+            public bool TestStart(string name, string type, string method)
+            {
                 recorder.RecordStart(GetTestCase(type, method));
                 return !cancelledThunk();
             }
 
-            private TestCase GetTestCase(string type, string method) {
-                string fullyQualifiedName = type + "." + method;
+            private static string GetFullyQualifiedName(string type, string method)
+            {
+                return String.Format("{0}.{1}", type, method);
+            }
+
+            private TestCase GetTestCase(string type, string method)
+            {
+                return GetTestCase(GetFullyQualifiedName(type, method));
+            }
+
+            private TestCase GetTestCase(string fullyQualifiedName)
+            {
                 return testCases[fullyQualifiedName];
             }
 
-            private VsTestResult MakeVsTestResult(string type, string method, double duration, string output, TestOutcome outcome) {
-                VsTestResult result = new VsTestResult(GetTestCase(type, method)) {
-                    Duration = TimeSpan.FromSeconds(duration),
+            private string GetTestResultDisplayName(string testCaseDisplayName, string testResultDisplayName, string fullyQualifiedName)
+            {
+                // If the display name looks like fully qualified name + parameters (as in the case of
+                // [Theory]), we want to follow the same DisplayName pattern we used earlier with the
+                // test case.
+                if (!testResultDisplayName.StartsWith(fullyQualifiedName, StringComparison.OrdinalIgnoreCase))
+                    return testResultDisplayName;
+
+                return testCaseDisplayName + testResultDisplayName.Substring(fullyQualifiedName.Length);
+            }
+
+            private VsTestResult MakeVsTestResult(string name, string type, string method, double duration, string output, TestOutcome outcome)
+            {
+                string fullyQualifiedName = GetFullyQualifiedName(type, method);
+                TestCase testCase = GetTestCase(fullyQualifiedName);
+
+                VsTestResult result = new VsTestResult(testCase)
+                {
                     ComputerName = Environment.MachineName,
+                    DisplayName = GetTestResultDisplayName(testCase.DisplayName, name, fullyQualifiedName),
+                    Duration = TimeSpan.FromSeconds(duration),
                     Outcome = outcome,
                 };
 
-                if (!String.IsNullOrWhiteSpace(output))
+                // Work around VS considering a test "not run" when the duration is 0
+                if (result.Duration.TotalMilliseconds == 0)
+                    result.Duration = TimeSpan.FromMilliseconds(1);
+
+                if (!String.IsNullOrEmpty(output))
                     result.Messages.Add(new TestResultMessage(TestResultMessage.StandardOutCategory, output));
 
                 return result;
@@ -190,8 +288,10 @@ namespace Xunit.Runner.VisualStudio {
         }
 
         // Splits a fully qualified method name into the type and method components
-        class TypeAndMethod {
-            public TypeAndMethod(string typeAndMethod) {
+        class TypeAndMethod
+        {
+            public TypeAndMethod(string typeAndMethod)
+            {
                 int idx = typeAndMethod.LastIndexOf('.');
                 Type = typeAndMethod.Substring(0, idx);
                 Method = typeAndMethod.Substring(idx + 1);
