@@ -187,19 +187,6 @@ namespace Xunit.Runner.VisualStudio
         static bool ContainsAppX(IEnumerable<string> sources)
             => sources.Any(s => string.Compare(Path.GetExtension(s), ".appx", StringComparison.OrdinalIgnoreCase) == 0);
 
-        static ITestCase Deserialize(LoggerHelper logger, ITestFrameworkExecutor executor, TestCase testCase)
-        {
-            try
-            {
-                return executor.Deserialize(testCase.GetPropertyValue<string>(SerializedTestCaseProperty, null));
-            }
-            catch (Exception ex)
-            {
-                logger.LogError("Unable to de-serialize test case {0}: {1}", testCase.DisplayName, ex);
-                return null;
-            }
-        }
-
         void DiscoverTests<TVisitor>(IEnumerable<string> sources,
                                      LoggerHelper logger,
                                      TestPlatformContext testPlatformContext,
@@ -522,16 +509,47 @@ namespace Xunit.Runner.VisualStudio
                     }
                     else
                     {
-                        // We are in Run Specific tests scenario, the `TestCase` objects are available.
-                        // Query the `TestCase` objects to find XunitTestCase objects.
-                        foreach (var vstestCase in runInfo.TestCases)
+                        try
                         {
-                            var xunitTestCase = Deserialize(logger, controller, vstestCase);
-                            if (xunitTestCase != null)
+                            var serializations = runInfo.TestCases
+                                                        .Select(tc => tc.GetPropertyValue<string>(SerializedTestCaseProperty, null))
+                                                        .ToList();
+
+                            var deserializedTestCasesByUniqueId = controller.BulkDeserialize(serializations);
+
+                            if (deserializedTestCasesByUniqueId == null)
+                                logger.LogErrorWithSource(assemblyFileName, "Received null response from BulkDeserialize");
+                            else
                             {
-                                testCasesMap.Add(xunitTestCase.UniqueID, vstestCase);
-                                testCases.Add(xunitTestCase);
+                                logger.Log("Received {0} results from {1} requests", deserializedTestCasesByUniqueId.Count, serializations.Count);
+
+                                for (int idx = 0; idx < runInfo.TestCases.Count; ++idx)
+                                {
+                                    try
+                                    {
+                                        var kvp = deserializedTestCasesByUniqueId[idx];
+                                        var vsTestCase = runInfo.TestCases[idx];
+
+                                        if (kvp.Value == null)
+                                        {
+                                            logger.LogErrorWithSource(assemblyFileName, "Test case {0} failed to deserialize: {1}", vsTestCase.DisplayName, kvp.Key);
+                                        }
+                                        else
+                                        {
+                                            testCasesMap.Add(kvp.Key, vsTestCase);
+                                            testCases.Add(kvp.Value);
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        logger.LogErrorWithSource(assemblyFileName, "Catastrophic error deserializing item #{0}: {1}", idx, ex);
+                                    }
+                                }
                             }
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarningWithSource(assemblyFileName, "Catastrophic error during deserialization: {0}", ex);
                         }
                     }
 
