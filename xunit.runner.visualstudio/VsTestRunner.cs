@@ -12,8 +12,8 @@ using Xunit.Abstractions;
 #if NETCOREAPP1_0
 using System.Reflection;
 using System.Text;
-using Microsoft.DotNet.InternalAbstractions;
-using Microsoft.Extensions.DependencyModel;
+using Internal.Microsoft.DotNet.PlatformAbstractions;
+using Internal.Microsoft.Extensions.DependencyModel;
 #elif NET452
 using System.Reflection;
 #endif
@@ -490,8 +490,6 @@ namespace Xunit.Runner.VisualStudio
 
                         // Filter tests
                         var traitNames = new HashSet<string>(assemblyDiscoveredInfo.DiscoveredTestCases.SelectMany(testCase => testCase.TraitNames));
-
-                        // Apply any filtering
                         var filter = new TestCaseFilter(runContext, logger, assemblyDiscoveredInfo.AssemblyFileName, traitNames);
                         var filteredTestCases = assemblyDiscoveredInfo.DiscoveredTestCases.Where(dtc => filter.MatchTestCase(dtc.VSTestCase)).ToList();
 
@@ -515,14 +513,18 @@ namespace Xunit.Runner.VisualStudio
                                                         .Select(tc => tc.GetPropertyValue<string>(SerializedTestCaseProperty, null))
                                                         .ToList();
 
+                            if (configuration.InternalDiagnosticMessagesOrDefault)
+                                logger.LogWithSource(runInfo.AssemblyFileName, "Deserializing {0} test case(s):{1}{2}",
+                                                                                serializations.Count,
+                                                                                Environment.NewLine,
+                                                                                string.Join(Environment.NewLine, serializations.Select(x => $"  {x}")));
+
                             var deserializedTestCasesByUniqueId = controller.BulkDeserialize(serializations);
 
                             if (deserializedTestCasesByUniqueId == null)
                                 logger.LogErrorWithSource(assemblyFileName, "Received null response from BulkDeserialize");
                             else
                             {
-                                logger.Log("Received {0} results from {1} requests", deserializedTestCasesByUniqueId.Count, serializations.Count);
-
                                 for (int idx = 0; idx < runInfo.TestCases.Count; ++idx)
                                 {
                                     try
